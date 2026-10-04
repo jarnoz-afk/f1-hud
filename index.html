@@ -356,17 +356,21 @@ async function getToken(){
   const j = await res.json();
   A.token = j.access_token; A.exp = Date.now() + (+j.expires_in || 3600) * 1000;
 }
-function api(endpoint, filters){
-  const url = encodeURI(API + endpoint + '?' + filters.join('&'));
+const queues = {};
+function api(endpoint, filters, base){
+  const B = base || API, local = B !== API;
+  const url = encodeURI(B + endpoint + '?' + filters.join('&'));
   const run = async () => {
     for (let a = 0; a < 5; a++){
-      const wait = lastReq + (A.token ? 1050 : GAP_MS) - Date.now();
-      if (wait > 0) await sleep(wait);
-      lastReq = Date.now();
-      if (A.user && (!A.token || Date.now() > A.exp - 120e3)) await getToken();
+      if (!local){
+        const wait = lastReq + (A.token ? 1050 : GAP_MS) - Date.now();
+        if (wait > 0) await sleep(wait);
+        lastReq = Date.now();
+        if (A.user && (!A.token || Date.now() > A.exp - 120e3)) await getToken();
+      }
       let res;
-      try { res = await fetch(url, A.token ? {headers:{Authorization:'Bearer ' + A.token}} : undefined); }
-      catch(e){ if (a === 4) throw new Error('Geen verbinding met OpenF1. Controleer je internetverbinding.'); await sleep(3000); continue; }
+      try { res = await fetch(url, !local && A.token ? {headers:{Authorization:'Bearer ' + A.token}} : undefined); }
+      catch(e){ if (a === 4) throw new Error(local ? 'Geen verbinding met de eigen server. Draait f1hud_server.py nog?' : 'Geen verbinding met OpenF1. Controleer je internetverbinding.'); await sleep(local ? 1000 : 3000); continue; }
       if (res.status === 429){ await sleep(8000 * (a + 1)); continue; }
       if (res.status === 404) return [];
       if (res.status === 401 && A.user && a < 2){ A.token = null; continue; }
@@ -377,8 +381,9 @@ function api(endpoint, filters){
     }
     throw new Error('Limiet van OpenF1 bereikt. Wacht een minuut en laad opnieuw.');
   };
-  const p = queue.then(run, run);
-  queue = p.catch(() => {});
+  const q = queues[B] || Promise.resolve();
+  const p = q.then(run, run);
+  queues[B] = p.catch(() => {});
   return p;
 }
 
@@ -501,7 +506,7 @@ function drawTrack(pts){
   const d = 'M' + pts.map(p => S.tf(p).map(v => v.toFixed(1)).join(' ')).join('L') + 'Z';
   $('#track').setAttribute('d', d); $('#trackGlow').setAttribute('d', d);
 }
-async function loadOutline(k){
+async function loadOutline(k, B){
   let best = null;
   for (const [n, a] of S.laps) if (!best || a.length > best[1].length) best = [n, a];
   let from, to, num;
@@ -512,7 +517,7 @@ async function loadOutline(k){
   } else {
     num = [...S.drv.keys()][0]; from = S.t0 + 20 * 60e3; to = from + 120e3;
   }
-  const rows = await api('location', [k, 'driver_number=' + num, 'date>=' + iso(from), 'date<' + iso(to)]);
+  const rows = await api('location', [k, 'driver_number=' + num, 'date>=' + iso(from), 'date<' + iso(to)], B);
   drawTrack(rows.map(r => ({x:r.x, y:r.y})));
   return rows;
 }
@@ -587,19 +592,20 @@ async function loadRace(sessArg, live = false){
   $('#bootTitle').textContent = `${sess.location} ${sess.year}, ${sess.session_name}`;
   $('#load').disabled = true;
   const k = 'session_key=' + sess.session_key;
+  const B = live ? S.liveBase : API;
   try {
-    const drivers = await step('Rijders', () => api('drivers', [k]));
-    const laps    = await step('Rondetijden', () => api('laps', [k]));
-    const stints  = await step('Bandenstints', () => api('stints', [k]));
-    const pits    = await step('Pitstops', () => api('pit', [k]));
-    const rc      = await step('Race control', () => api('race_control', [k]));
-    const wx      = await step('Weer', () => api('weather', [k]));
-    const pos     = await step('Posities', () => api('position', [k]));
-    const iv      = await step('Gaten en intervallen', () => api('intervals', [k]));
-    const radio   = await step('Teamradio', () => api('team_radio', [k]));
+    const drivers = await step('Rijders', () => api('drivers', [k], B));
+    const laps    = await step('Rondetijden', () => api('laps', [k], B));
+    const stints  = await step('Bandenstints', () => api('stints', [k], B));
+    const pits    = await step('Pitstops', () => api('pit', [k], B));
+    const rc      = await step('Race control', () => api('race_control', [k], B));
+    const wx      = await step('Weer', () => api('weather', [k], B));
+    const pos     = await step('Posities', () => api('position', [k], B));
+    const iv      = await step('Gaten en intervallen', () => api('intervals', [k], B));
+    const radio   = await step('Teamradio', () => api('team_radio', [k], B));
 
     S.sess = sess; S.t0 = ms(sess.date_start); S.liveMode = live;
-    S.t1 = live ? Date.now() - DELAY : ms(sess.date_end);
+    S.t1 = live ? Date.now() - S.delay : ms(sess.date_end);
     S.drv = new Map();
     for (const d of drivers) if (d.driver_number != null && !S.drv.has(d.driver_number))
       S.drv.set(d.driver_number, {...d, color: d.team_colour ? '#' + String(d.team_colour).replace('#','') : '#4FD8FF'});
@@ -613,8 +619,8 @@ async function loadRace(sessArg, live = false){
     rebuildLaps();
 
     S.tf = null; $('#track').setAttribute('d',''); $('#trackGlow').setAttribute('d','');
-    await step('Circuit tekenen', () => loadOutline(k));
-    if (!S.tf) await step('Circuit uit eerdere sessie', () => outlineFromMeeting(sess));
+    await step('Circuit tekenen', () => loadOutline(k, B));
+    if (!S.tf){ try { await step('Circuit uit eerdere sessie', () => outlineFromMeeting(sess)); } catch(e){ bootLog('Circuit niet beschikbaar, de kaart blijft leeg.', 'err'); } }
 
     $('#emptyText').style.display = 'none';
     $('#raceName').textContent = `${sess.location} ${sess.year}`;
@@ -640,12 +646,18 @@ async function loadRace(sessArg, live = false){
     await sleep(500);
     boot.classList.add('done'); setTimeout(() => { boot.hidden = true; }, 460);
   } catch(e){
-    bootLog(e.message, 'err'); $('#bootClose').hidden = false;
+    bootLog(e.message, 'err');
+    if (live && !A.user){
+      const free = new Date(ms(sess.date_end) + 30 * 60e3).toLocaleTimeString('nl-NL', {hour:'2-digit', minute:'2-digit'});
+      bootLog(`Zonder account geeft OpenF1 tijdens de sessie geen data. Vanaf ongeveer ${free} staat deze sessie gratis als replay in de lijst (later als de sessie uitloopt).`, 'err');
+    }
+    $('#bootClose').hidden = false;
   } finally { $('#load').disabled = false; }
 }
 
 /* ---------- live ---------- */
-const DELAY = 8000;   // marge zodat positiedata binnen is voordat we hem tonen
+S.delay = 8000;   // marge zodat data binnen is voordat we hem tonen
+const TASKS_LOCAL = ['position','intervals','laps','race_control','pit','stints','team_radio','weather','hud_status'];
 const TASKS = ['location','position','intervals','location','laps','race_control','location','position','intervals','location','pit','stints','team_radio','weather'];
 function mergeG(map, rows){
   for (const r of rows){
@@ -656,18 +668,25 @@ function mergeG(map, rows){
   for (const a of map.values()) if (a._dirty){ a.sort((x,y) => x._t - y._t); a._dirty = false; }
 }
 async function pollOne(ep, k){
+  const B = S.liveBase;
+  if (ep === 'hud_status'){
+    const r = (await api('hud_status', [], B))[0];
+    if (r && r.total_laps){ S.liveTotal = r.total_laps; S.totalLaps = r.total_laps; }
+    if (r && !r.connected) setText($('#liveNote'), 'Eigen server heeft geen verbinding met F1.');
+    return;
+  }
   if (ep === 'laps'){
-    const rows = await api('laps', S.maxLap <= 3 ? [k] : [k, 'date_start>=' + iso(Date.now() - 5 * 60e3)]);
+    const rows = await api('laps', S.maxLap <= 3 ? [k] : [k, 'date_start>=' + iso(Date.now() - 5 * 60e3)], B);
     for (const r of rows) S.lapsRaw.set(r.driver_number + '-' + r.lap_number, r);
     rebuildLaps(); return;
   }
   if (ep === 'stints'){
-    const rows = await api('stints', [k]);
+    const rows = await api('stints', [k], B);
     if (rows.length){ S.stints = group(rows); for (const a of S.stints.values()) a.sort((x,y) => x.stint_number - y.stint_number); }
     return;
   }
   const since = S.liveLast[ep] || S.t0 - 3600e3;
-  const rows = prep(await api(ep, [k, 'date>=' + iso(since + 1)]));
+  const rows = prep(await api(ep, [k, 'date>=' + iso(since + 1)], B));
   if (!rows.length) return;
   S.liveLast[ep] = Math.max(since, rows[rows.length-1]._t);
   if (ep === 'location'){
@@ -686,9 +705,11 @@ async function pollOne(ep, k){
 }
 async function poller(gen){
   const k = 'session_key=' + S.sess.session_key; let i = 0, fails = 0;
+  const local = S.liveBase !== API, list = local ? TASKS_LOCAL : TASKS;
   while (S.liveMode && gen === S.pollGen){
-    const ep = TASKS[i++ % TASKS.length];
-    try { await pollOne(ep, k); fails = 0; setText($('#liveNote'), ''); }
+    const ep = list[i++ % list.length];
+    if (local && i % list.length === 0) await sleep(1000);
+    try { await pollOne(ep, k); fails = 0; if (ep !== 'hud_status') setText($('#liveNote'), ''); }
     catch(e){ fails++; setText($('#liveNote'), 'Live: ' + e.message); await sleep(Math.min(30000, 3000 * fails)); }
     if (Date.now() > ms(S.sess.date_end) + 30 * 60e3){ setText($('#liveNote'), 'Sessie afgelopen. Live-verbinding gestopt.'); return; }
   }
@@ -715,7 +736,10 @@ async function connectLive(){
     if (!s0){ setText($('#lvMsg'), 'OpenF1 gaf geen sessie terug.'); return; }
     const start = ms(s0.date_start), end = ms(s0.date_end);
     if (now < start - 30 * 60e3 || now > end + 30 * 60e3){
-      setText($('#lvMsg'), `Er loopt nu geen sessie. Meest recente: ${s0.location} ${s0.year}, ${s0.session_name}, ${new Date(start).toLocaleString('nl-NL', {dateStyle:'medium', timeStyle:'short'})}.`);
+      if (now > end + 30 * 60e3){
+        setText($('#lvMsg'), `Er loopt nu geen sessie. ${s0.location}, ${s0.session_name} is afgelopen en staat nu gratis als replay in de lijst.`);
+        $('#year').value = s0.year; loadSessions(s0.year);
+      } else setText($('#lvMsg'), `Er loopt nu geen sessie. Volgende: ${s0.location}, ${s0.session_name}, ${new Date(start).toLocaleString('nl-NL', {dateStyle:'medium', timeStyle:'short'})}.`);
       return;
     }
     S.liveTotal = +$('#lvLaps').value || 0;
@@ -724,14 +748,36 @@ async function connectLive(){
   } catch(e){ setText($('#lvMsg'), e.message); }
   finally { $('#lvGo').disabled = false; }
 }
-$('#goLive').addEventListener('click', openLive);
+async function connectLocal(){
+  try {
+    const ss = await api('sessions', ['session_key=latest'], S.localBase);
+    const s0 = ss[0], now = Date.now();
+    if (!s0){ alert('De eigen server heeft nog geen sessie van F1 ontvangen. Probeer het vlak voor of tijdens een sessie.'); return; }
+    const start = ms(s0.date_start), end = ms(s0.date_end);
+    if (now < start - 30 * 60e3 || now > end + 30 * 60e3){
+      alert(`Er loopt nu geen sessie. Laatst bekend: ${s0.location}, ${s0.session_name}, ${new Date(start).toLocaleString('nl-NL', {dateStyle:'medium', timeStyle:'short'})}.`);
+      return;
+    }
+    S.liveBase = S.localBase; S.delay = 3000; S.liveTotal = s0.total_laps || 0;
+    loadRace(s0, true);
+  } catch(e){ alert(e.message); }
+}
+$('#goLive').addEventListener('click', () => { if (S.localBase) connectLocal(); else { S.liveBase = API; S.delay = 8000; openLive(); } });
+// draait deze pagina op de eigen server? Dan gaat live daarlangs.
+(async () => {
+  if (!/^https?:$/.test(location.protocol) || /github\.io$/.test(location.hostname)) return;
+  try {
+    const r = await fetch(location.origin + '/v1/hud_status', {cache:'no-store'});
+    if (r.ok && Array.isArray(await r.json())){ S.localBase = location.origin + '/v1/'; $('#goLive').textContent = 'Live (eigen server)'; }
+  } catch(e){}
+})();
 $('#lvGo').addEventListener('click', connectLive);
 $('#lvCancel').addEventListener('click', () => $('#liveDlg').close());
 
 /* ---------- positiedata in blokken ---------- */
 async function ensureLoc(t){
   if (!S.sess || S.locLoading || S.scrubbing || Date.now() < S.locRetryAt) return;
-  if (S.liveMode && t > S.t1 - 30e3) return;   // live: de poller levert positiedata
+  if (S.liveMode && (t > S.t1 - 30e3 || S.liveBase !== API)) return;   // live: poller levert positiedata, eigen server heeft er geen
   const inBuf = S.locTo != null && t >= S.locFrom && t < S.locTo;
   if (inBuf && t < S.locTo - 45e3) return;
   if (t >= S.t1) return;
@@ -1144,7 +1190,7 @@ function frame(now){
   const dt = Math.min(250, now - prev); prev = now;
   if (S.sess){
     if (S.liveMode){
-      S.t1 = Date.now() - DELAY;
+      S.t1 = Date.now() - S.delay;
       if (S.following) S.t = S.t1;
       else if (S.playing){ S.t += dt * S.speed; if (S.t >= S.t1){ S.t = S.t1; goLiveEdge(); } }
     } else if (S.playing){ S.t = Math.min(S.t1, S.t + dt * S.speed); if (S.t >= S.t1){ S.playing = false; setPlayBtn(); } }
@@ -1178,7 +1224,8 @@ async function loadSessions(year){
   try {
     const s = await api('sessions', ['year=' + year, 'session_type=Race']);
     const now = Date.now();
-    S.sessions = s.filter(x => ms(x.date_end) < now - 3600e3).sort((a,b) => ms(a.date_start) - ms(b.date_start));
+    S.sessions = s.filter(x => ms(x.date_end) < now - 31 * 60e3)   // OpenF1: gratis vanaf 30 min na het einde
+   .sort((a,b) => ms(a.date_start) - ms(b.date_start));
     sel.innerHTML = '';
     if (!S.sessions.length){ sel.innerHTML = '<option>Geen gereden races gevonden</option>'; return; }
     S.sessions.forEach((x, i) => { const o = document.createElement('option'); o.value = i; o.textContent = `${x.location} (${x.session_name})`; sel.appendChild(o); });
